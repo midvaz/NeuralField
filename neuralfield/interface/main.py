@@ -28,7 +28,7 @@ def main_windows(page: ft.Page):
     page.window.width = WINDOW_WIDTH
     page.window.height = WINDOW_HEIGHT
     
-    def on_upload(e: ft.FilePickerResultEvent):
+    def __on_upload(e: ft.FilePickerResultEvent):
         if e.files:
             # Открываем изображение из локального пути
             #TODO: вызываем обрабоку изображения
@@ -42,7 +42,7 @@ def main_windows(page: ft.Page):
             text_right.update()
 
     # Создаем кнопку загрузки и подключаем FilePicker
-    file_picker = ft.FilePicker(on_result=on_upload)
+    file_picker = ft.FilePicker(on_result=__on_upload)
     page.overlay.append(file_picker)
 
     # Добавляем кнопку загрузки
