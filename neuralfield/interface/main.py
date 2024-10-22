@@ -1,4 +1,6 @@
 
+from pathlib import Path
+
 import flet as ft
 
 
@@ -9,7 +11,10 @@ WINDOW_HEIGHT = 650
 IMG_WIDTH = 500
 IMG_HEIGHT = 500
 
-MOCK_SELECT_IMG_PATH = "C:\\My_project\\NeuralField\\neuralfield\\data\\mock.png"
+base_dir = Path(__file__).parent  # Текущая директория скрипта
+file_name = "mock.png"
+
+MOCK_SELECT_IMG_PATH = str(base_dir / ".." / "data" / file_name)
 
 MESSAGE_MOCK_RESULT = "Тут будет результат обработки"
 MESSAGE_SELECT_PATH = "Выбор изображения"
