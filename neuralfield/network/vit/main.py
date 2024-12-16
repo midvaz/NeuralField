@@ -2,6 +2,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 import matplotlib.pyplot as plt
 import numpy as np
+import os
 from tensorflow.keras.utils import plot_model
 
 # Убедимся, что TensorFlow использует GPU
@@ -14,6 +15,14 @@ if physical_devices:
         print(f"Ошибка настройки памяти GPU: {e}")
 else:
     print("GPU не обнаружен. Используется CPU.")
+
+# Параметры датасета
+DATASET_DIR = "/mnt/e/Agriculture-Vision-2021 2"  # Задайте путь к датасету
+TRAIN_DIR = os.path.join(DATASET_DIR, "train")
+VAL_DIR = os.path.join(DATASET_DIR, "val")
+IMG_SIZE = 512  # Размер входного изображения
+BATCH_SIZE = 16
+NUM_CLASSES = 9  # Количество классов сегментации
 
 # Патчинг изображения
 class PatchEmbedding(layers.Layer):
@@ -101,13 +110,11 @@ class VisionTransformer(Model):
         return x
 
 # Параметры модели
-IMG_SIZE = 512  # Размер входного изображения (512x512), специфичный для Agriculture-Vision
-PATCH_SIZE = 32 # Размер патча, оптимальный для больших изображений
-NUM_CLASSES = 9  # Количество классов сегментации в Agriculture-Vision
-EMBED_DIM = 512  # Увеличенная размерность эмбеддингов для сложных данных
-DEPTH = 12  # Увеличенное количество трансформерных блоков
-NUM_HEADS = 16  # Больше голов для Multi-Head Attention
-MLP_DIM = 1024  # Увеличенная размерность скрытого слоя в MLP
+PATCH_SIZE = 32 # Размер патча
+EMBED_DIM = 512  # Увеличенная размерность эмбеддингов
+DEPTH = 12  # Количество трансформерных блоков
+NUM_HEADS = 16  # Голов для Multi-Head Attention
+MLP_DIM = 1024  # Размерность скрытого слоя в MLP
 DROPOUT_RATE = 0.1
 
 # Создание модели
@@ -134,7 +141,7 @@ vit_segmentation_model.build((None, IMG_SIZE, IMG_SIZE, 3))
 vit_segmentation_model.summary()
 
 # Сохранение схемы модели
-plot_model(vit_segmentation_model, to_file="vit_model_architecture.png", show_shapes=True)
+# plot_model(vit_segmentation_model, to_file="vit_model_architecture.png", show_shapes=True)
 
 # Функции для оценки
 from sklearn.metrics import confusion_matrix, f1_score, jaccard_score
@@ -181,9 +188,41 @@ class TrainingPlotCallback(tf.keras.callbacks.Callback):
 
         plt.show()
 
-# Пример использования (замените на свои данные)
-# y_true и y_pred должны быть массивами numpy одинаковой формы
-# y_true = np.array([...])
-# y_pred = np.array([...])
-# metrics = evaluate_model(y_true, y_pred, NUM_CLASSES)
-# plot_metrics(metrics, ["Mean Accuracy", "IoU", "F1-Score"])
+# Функция для загрузки данных
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+
+def load_dataset(image_dir, mask_dir, img_size):
+    image_filenames = sorted(os.listdir(image_dir))
+    mask_filenames = sorted(os.listdir(mask_dir))
+
+    images = []
+    masks = []
+
+    for img_file, mask_file in zip(image_filenames, mask_filenames):
+        img = load_img(os.path.join(image_dir, img_file), target_size=(img_size, img_size))
+        mask = load_img(os.path.join(mask_dir, mask_file), target_size=(img_size, img_size), color_mode="grayscale")
+        images.append(img_to_array(img) / 255.0)
+        masks.append(img_to_array(mask).astype("int"))
+
+    return np.array(images), np.array(masks)
+
+# Загрузка данных
+train_images, train_masks = load_dataset(os.path.join(TRAIN_DIR, "images/rgb"), os.path.join(TRAIN_DIR, "masks"), IMG_SIZE)
+val_images, val_masks = load_dataset(os.path.join(VAL_DIR, "images"), os.path.join(VAL_DIR, "masks"), IMG_SIZE)
+
+# Обучение модели
+history = vit_segmentation_model.fit(
+    x=train_images,
+    y=train_masks,
+    validation_data=(val_images, val_masks),
+    batch_size=BATCH_SIZE,
+    epochs=50,
+    callbacks=[TrainingPlotCallback()]
+)
+
+# Пример использования метрик на валидационном наборе
+val_predictions = vit_segmentation_model.predict(val_images)
+metrics = evaluate_model(val_masks, val_predictions, NUM_CLASSES)
+plot_metrics(metrics, ["Mean Accuracy", "IoU", "F1-Score"])
+
+print("Обучение завершено. Схема модели сохранена в 'vit_model_architecture.png'")
