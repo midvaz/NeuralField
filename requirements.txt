@@ -1,0 +1,9 @@
+flet
+flet-desktop
+keras
+scikit-image
+numpy
+imutils
+matplotlib
+pathlib
+opencv-python
