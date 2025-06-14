@@ -5,9 +5,11 @@
 
 ## Установка проектного менеджера 
 ```bash
+in Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-cd tests
+in Windows 
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 uv init
 ```

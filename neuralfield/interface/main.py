@@ -16,7 +16,7 @@ file_name = "mock.png"
 
 MOCK_SELECT_IMG_PATH = str(base_dir / ".." / "data" / file_name)
 
-MESSAGE_MOCK_RESULT = "Тут будет результат обработки"
+MESSAGE_MOCK_RESULT = "Место для результатов обработки"
 MESSAGE_SELECT_PATH = "Выбор изображения"
 
 
@@ -24,7 +24,7 @@ def main_windows(page: ft.Page):
     page.title = "NeuralField"
 
     page.vertical_alignment = ft.MainAxisAlignment.CENTER
-    page.theme = ft.theme.Theme(color_scheme_seed="black")
+    page.theme = ft.Theme(color_scheme_seed="black")
     page.window.width = WINDOW_WIDTH
     page.window.height = WINDOW_HEIGHT
     
@@ -76,7 +76,6 @@ def main_windows(page: ft.Page):
         size=48,
         width=400,
         height=400,
-        color=ft.colors.WHITE,
     )
     
     row_layout = ft.Row(

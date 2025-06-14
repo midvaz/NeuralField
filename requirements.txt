@@ -7,3 +7,10 @@ imutils
 matplotlib
 pathlib
 opencv-python
+geopandas
+shapely
+rasterio
+albumentations
+torch
+tqdm
+transformers

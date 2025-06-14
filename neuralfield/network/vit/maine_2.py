@@ -1,243 +1,292 @@
-import tensorflow as tf
-from tensorflow.keras import layers, Model
-import matplotlib.pyplot as plt
+"""
+agri_segformer.py – SegFormer‑B✱ fine‑tuning on Agriculture‑Vision **2021** with 5‑channel inputs
+(RGB + NIR + NDVI) and the *official* folder structure you showed.
+
+──────────────────────────────────────────────────────────────────────────────
+**Dataset tree expected now**
+```
+Agriculture-Vision-2021/
+  train/
+    images/
+      rgb/      *.jpg / *.png
+      nir/      *.jpg / *.png  (same filenames as RGB)
+    masks/        *.png        (single‑channel class indices 0…N‑1, 255=ignore)
+  val/
+    images/
+      rgb/
+      nir/
+    masks/
+  test/  ... (optional)
+```
+Other official folders (`boundaries/`, `labels/`) are ignored by this script.
+
+──────────────────────────────────────────────────────────────────────────────
+Quick start
+```bash
+python agri_segformer.py \
+  --train-dir "D:/Agriculture-Vision-2021/train" \
+  --val-dir   "D:/Agriculture-Vision-2021/val" \
+  --num-classes 9 --batch-size 4 --epochs 50 \
+  --checkpoint-dir runs/segformer_5ch
+```
+If you prefer the previous explicit arguments, they still work (`--train-rgb`,
+`--train-nir`, etc.). When `--train-dir`/`--val-dir` **are given**, they take
+priority and the script automatically resolves sub‑folders as shown above.
+
+After training you’ll find:
+* `best_model.pt` – weights with best mIoU.
+* `train.csv` – metrics log.
+* TensorBoard logs in `tb/`.
+"""
+
+from __future__ import annotations
+import argparse
+import csv
+from pathlib import Path
+from typing import List, Tuple
+
+import albumentations as A
+import cv2
 import numpy as np
-import os
-from tensorflow.keras.utils import plot_model
-
-# Убедимся, что TensorFlow использует GPU
-physical_devices = tf.config.list_physical_devices('GPU')
-if physical_devices:
-    try:
-        tf.config.experimental.set_memory_growth(physical_devices[0], True)
-        print("GPU доступен и будет использован для обучения.")
-    except RuntimeError as e:
-        print(f"Ошибка настройки памяти GPU: {e}")
-else:
-    print("GPU не обнаружен. Используется CPU.")
-
-# Параметры датасета
-DATASET_DIR = "dataset"  # Задайте путь к датасету
-TRAIN_DIR = os.path.join(DATASET_DIR, "train")
-VAL_DIR = os.path.join(DATASET_DIR, "val")
-IMG_SIZE = 512  # Размер входного изображения
-BATCH_SIZE = 32
-NUM_CLASSES = 9  # Количество классов сегментации
-
-# Патчинг изображения
-class PatchEmbedding(layers.Layer):
-    def __init__(self, patch_size, embed_dim):
-        super().__init__()
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
-
-    def build(self, input_shape):
-        self.projection = layers.Conv2D(
-            filters=self.embed_dim,
-            kernel_size=self.patch_size,
-            strides=self.patch_size,
-            padding="valid"
-        )
-        self.flatten = layers.Reshape((-1, self.embed_dim))
-
-    def call(self, inputs):
-        x = self.projection(inputs)
-        x = self.flatten(x)
-        return x
-
-# Трансформерный блок
-class TransformerBlock(layers.Layer):
-    def __init__(self, embed_dim, num_heads, mlp_dim, dropout_rate=0.1):
-        super().__init__()
-        self.attention = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
-        self.dropout1 = layers.Dropout(dropout_rate)
-        self.norm1 = layers.LayerNormalization(epsilon=1e-6)
-
-        self.mlp = tf.keras.Sequential([
-            layers.Dense(mlp_dim, activation=tf.nn.gelu),
-            layers.Dropout(dropout_rate),
-            layers.Dense(embed_dim),
-            layers.Dropout(dropout_rate),
-        ])
-        self.norm2 = layers.LayerNormalization(epsilon=1e-6)
-
-    def call(self, inputs, training=False):
-        attn_output = self.attention(inputs, inputs)
-        attn_output = self.dropout1(attn_output, training=training)
-        out1 = self.norm1(inputs + attn_output)
-
-        mlp_output = self.mlp(out1, training=training)
-        return self.norm2(out1 + mlp_output)
-
-# Модель ViT для семантической сегментации
-class VisionTransformer(Model):
-    def __init__(self, img_size, patch_size, num_classes, embed_dim, depth, num_heads, mlp_dim, dropout_rate=0.1):
-        super().__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) ** 2
-
-        self.patch_embedding = PatchEmbedding(patch_size, embed_dim)
-        self.position_embedding = self.add_weight(
-            shape=(1, self.num_patches, embed_dim),
-            initializer="random_normal",
-            trainable=True
-        )
-
-        self.transformer_blocks = [
-            TransformerBlock(embed_dim, num_heads, mlp_dim, dropout_rate) for _ in range(depth)
-        ]
-
-        self.decoder = tf.keras.Sequential([
-            layers.Dense(embed_dim),
-            layers.Reshape((img_size // patch_size, img_size // patch_size, embed_dim)),
-            layers.Conv2DTranspose(filters=embed_dim // 2, kernel_size=2, strides=2, activation="relu"),
-            layers.Conv2DTranspose(filters=embed_dim // 4, kernel_size=2, strides=2, activation="relu"),
-            layers.Conv2D(num_classes, kernel_size=1, activation="softmax")
-        ])
-
-    def call(self, inputs):
-        # Преобразование в патчи и добавление позиционной эмбеддинга
-        x = self.patch_embedding(inputs)
-        x += self.position_embedding
-
-        # Пропуск через трансформерные блоки
-        for block in self.transformer_blocks:
-            x = block(x)
-
-        # Декодер для восстановления пространственной размерности
-        x = self.decoder(x)
-        return x
-
-# Параметры модели
-PATCH_SIZE = 32 # Размер патча
-EMBED_DIM = 512  # Увеличенная размерность эмбеддингов
-DEPTH = 12  # Количество трансформерных блоков
-NUM_HEADS = 16  # Голов для Multi-Head Attention
-MLP_DIM = 1024  # Размерность скрытого слоя в MLP
-DROPOUT_RATE = 0.1
-
-# Создание модели
-vit_segmentation_model = VisionTransformer(
-    img_size=IMG_SIZE,
-    patch_size=PATCH_SIZE,
-    num_classes=NUM_CLASSES,
-    embed_dim=EMBED_DIM,
-    depth=DEPTH,
-    num_heads=NUM_HEADS,
-    mlp_dim=MLP_DIM,
-    dropout_rate=DROPOUT_RATE
-)
-
-# Компиляция модели
-vit_segmentation_model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-    loss="sparse_categorical_crossentropy",
-    metrics=["accuracy"]
-)
-
-# Вывод структуры модели
-vit_segmentation_model.build((None, IMG_SIZE, IMG_SIZE, 3))
-vit_segmentation_model.summary()
-
-# Сохранение схемы модели
-plot_model(vit_segmentation_model, to_file="vit_model_architecture.png", show_shapes=True)
-
-# Функции для оценки
-from sklearn.metrics import confusion_matrix, f1_score, jaccard_score
-
-def evaluate_model(y_true, y_pred, num_classes):
-    y_true_flat = y_true.flatten()
-    y_pred_flat = np.argmax(y_pred, axis=-1).flatten()
-
-    cm = confusion_matrix(y_true_flat, y_pred_flat, labels=range(num_classes))
-    iou = jaccard_score(y_true_flat, y_pred_flat, average="macro")
-    f1 = f1_score(y_true_flat, y_pred_flat, average="macro")
-
-    mean_accuracy = np.diag(cm).sum() / cm.sum()
-
-    return mean_accuracy, iou, f1
-
-# Генерация гистограммы результатов
-def plot_metrics(metrics, labels):
-    plt.bar(labels, metrics, color=['blue', 'green', 'red'])
-    plt.xlabel("Метрики")
-    plt.ylabel("Значения")
-    plt.title("Оценка модели")
-    plt.show()
-
-# График обучения
-class TrainingPlotCallback(tf.keras.callbacks.Callback):
-    def on_train_begin(self, logs=None):
-        self.history = {"loss": [], "accuracy": []}
-
-    def on_epoch_end(self, epoch, logs=None):
-        self.history["loss"].append(logs.get("loss"))
-        self.history["accuracy"].append(logs.get("accuracy"))
-        
-        plt.figure(figsize=(10, 5))
-        plt.subplot(1, 2, 1)
-        plt.plot(self.history["loss"], label="Loss")
-        plt.title("Training Loss")
-        plt.legend()
-
-        plt.subplot(1, 2, 2)
-        plt.plot(self.history["accuracy"], label="Accuracy")
-        plt.title("Training Accuracy")
-        plt.legend()
-
-        plt.show()
-
-# Функция для загрузки данных
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
-
-def process_path(image_path, mask_path):
-    img = load_img(image_path, target_size=(IMG_SIZE, IMG_SIZE))
-    mask = load_img(mask_path, target_size=(IMG_SIZE, IMG_SIZE), color_mode="grayscale")
-    img = img_to_array(img) / 255.0
-    mask = img_to_array(mask).astype("int")
-    return img, mask
-
-def data_generator(image_dir, mask_dir, max_samples=2000):
-    image_filenames = sorted(os.listdir(image_dir))
-    mask_filenames = sorted(os.listdir(mask_dir))
-    count = 0  # Счётчик обработанных файлов
-
-    for img_filename, mask_filename in zip(image_filenames, mask_filenames):
-        if count >= max_samples:  # Проверка ограничения
-            break
-        img_path = os.path.join(image_dir, img_filename)
-        mask_path = os.path.join(mask_dir, mask_filename)
-        yield process_path(img_path, mask_path)
-        count += 1
+import torch
+from albumentations.pytorch import ToTensorV2
+from torch.utils.data import DataLoader, Dataset
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from tqdm import tqdm
+from transformers import SegformerForSemanticSegmentation, SegformerConfig
 
 
-def load_dataset(image_dir, mask_dir):
-    dataset = tf.data.Dataset.from_generator(
-        lambda: data_generator(image_dir, mask_dir),
-        output_types=(tf.float32, tf.int32),
-        output_shapes=((IMG_SIZE, IMG_SIZE, 3), (IMG_SIZE, IMG_SIZE, 1))
+# ----------------------------------------------------------------------------
+# Dataset helpers
+# ----------------------------------------------------------------------------
+class AgriVision5ChDataset(Dataset):
+    """Loads RGB + NIR ➜ computes NDVI ➜ returns 5‑channel tensor."""
+
+    def __init__(
+        self,
+        rgb_dir: Path,
+        nir_dir: Path,
+        mask_dir: Path,
+        size: int = 512,
+        augment: bool = False,
+    ):
+        self.rgb_paths = sorted(rgb_dir.glob("*"))
+        self.nir_dir = nir_dir
+        self.mask_dir = mask_dir
+        self.size = size
+        self.augment = augment
+        self.tf = self._build_tf()
+
+    def _build_tf(self):
+        tf = [A.Resize(self.size, self.size)]
+        if self.augment:
+            tf += [
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.RandomRotate90(p=0.5),
+                A.ColorJitter(p=0.3),
+            ]
+        tf += [A.Normalize(mean=(0.5,) * 5, std=(0.5,) * 5), ToTensorV2(transpose_mask=True)]
+        return A.Compose(tf)
+
+    def __len__(self):
+        return len(self.rgb_paths)
+
+    def __getitem__(self, idx):
+        rgb_path = self.rgb_paths[idx]
+        nir_path = self.nir_dir / rgb_path.name  # same filename, different folder
+        mask_path = self.mask_dir / rgb_path.with_suffix(".png").name  # masks as .png
+
+        rgb = cv2.cvtColor(cv2.imread(str(rgb_path)), cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        nir = cv2.imread(str(nir_path), cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0[..., None]
+
+        r = rgb[..., 0:1]
+        ndvi = (nir - r) / (nir + r + 1e-6)
+        ndvi = (ndvi + 1.0) / 2.0
+        img5 = np.concatenate((rgb, nir, ndvi), axis=-1)
+
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+
+        transformed = self.tf(image=img5, mask=mask)
+        return transformed["image"].float(), transformed["mask"].long()
+
+
+# ----------------------------------------------------------------------------
+# Metrics
+# ----------------------------------------------------------------------------
+@torch.no_grad()
+def compute_metrics(logits: torch.Tensor, target: torch.Tensor, num_classes: int) -> Tuple[float, float]:
+    preds = logits.argmax(1)
+    valid = target != 255
+    correct = (preds[valid] == target[valid]).sum()
+    total = valid.sum()
+    pix_acc = (correct / total).item() if total > 0 else 0.0
+    ious = []
+    for cls in range(num_classes):
+        inter = ((preds == cls) & (target == cls) & valid).sum().item()
+        union = ((preds == cls) | (target == cls)) & valid
+        union = union.sum().item()
+        if union > 0:
+            ious.append(inter / union)
+    miou = float(np.mean(ious)) if ious else 0.0
+    return pix_acc, miou
+
+
+# ----------------------------------------------------------------------------
+# Train / Val loops
+# ----------------------------------------------------------------------------
+LOSS = torch.nn.CrossEntropyLoss(ignore_index=255)
+
+def train_epoch(model, loader, opt, device, num_classes):
+    model.train()
+    tot_loss = tot_acc = tot_iou = 0.0
+    for img, mask in tqdm(loader, desc="Train", leave=False):
+        img, mask = img.to(device), mask.to(device)
+        opt.zero_grad()
+        out = model(pixel_values=img, labels=mask)
+        loss = out.loss
+        loss.backward()
+        opt.step()
+        acc, miou = compute_metrics(out.logits.detach(), mask, num_classes)
+        n = img.size(0)
+        tot_loss += loss.item() * n
+        tot_acc += acc * n
+        tot_iou += miou * n
+    n_samples = len(loader.dataset)
+    return tot_loss / n_samples, tot_acc / n_samples, tot_iou / n_samples
+
+
+@torch.no_grad()
+def eval_epoch(model, loader, device, num_classes):
+    model.eval()
+    tot_loss = tot_acc = tot_iou = 0.0
+    for img, mask in tqdm(loader, desc="Val", leave=False):
+        img, mask = img.to(device), mask.to(device)
+        out = model(pixel_values=img, labels=mask)
+        loss = out.loss
+        acc, miou = compute_metrics(out.logits, mask, num_classes)
+        n = img.size(0)
+        tot_loss += loss.item() * n
+        tot_acc += acc * n
+        tot_iou += miou * n
+    n_samples = len(loader.dataset)
+    return tot_loss / n_samples, tot_acc / n_samples, tot_iou / n_samples
+
+
+# ----------------------------------------------------------------------------
+# Utilities
+# ----------------------------------------------------------------------------
+
+def save_ckpt(model, path: Path, epoch: int, miou: float):
+    torch.save({"model": model.state_dict(), "epoch": epoch, "miou": miou}, path)
+
+
+def log_header(path: Path):
+    with open(path, "w", newline="") as f:
+        csv.writer(f).writerow(["epoch", "loss", "val_loss", "val_acc", "val_miou"])
+
+
+def log_row(path: Path, row: List):
+    with open(path, "a", newline="") as f:
+        csv.writer(f).writerow(row)
+
+
+# ----------------------------------------------------------------------------
+# Argument parsing helper
+# ----------------------------------------------------------------------------
+
+def resolve_dirs(args):
+    """Return (rgb_dir, nir_dir, masks_dir) for train and val splits."""
+    if args.train_dir:
+        t_root = Path(args.train_dir)
+        args.train_rgb = t_root / "images/rgb"
+        args.train_nir = t_root / "images/nir"
+        args.train_masks = t_root / "masks"
+    if args.val_dir:
+        v_root = Path(args.val_dir)
+        args.val_rgb = v_root / "images/rgb"
+        args.val_nir = v_root / "images/nir"
+        args.val_masks = v_root / "masks"
+    for p in [args.train_rgb, args.train_nir, args.train_masks, args.val_rgb, args.val_nir, args.val_masks]:
+        if not Path(p).exists():
+            raise FileNotFoundError(p)
+    return args
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Fine‑tune SegFormer with 5‑channel inputs on Agriculture‑Vision 2021")
+    # High‑level root folders (recommended)
+    parser.add_argument("--train-dir", type=str, help="train split folder containing images/ and masks/")
+    parser.add_argument("--val-dir", type=str, help="val split folder containing images/ and masks/")
+    # Low‑level explicit folders (fallback)
+    parser.add_argument("--train-rgb")
+    parser.add_argument("--train-nir")
+    parser.add_argument("--train-masks")
+    parser.add_argument("--val-rgb")
+    parser.add_argument("--val-nir")
+    parser.add_argument("--val-masks")
+
+    parser.add_argument("--num-classes", type=int, default=9)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=6e-5)
+    parser.add_argument("--checkpoint-dir", default="runs/segformer_5ch")
+    parser.add_argument("--model-size", choices=["b0", "b1", "b2", "b3", "b4", "b5"], default="b2")
+    parser.add_argument("--img-size", type=int, default=512)
+    args = parser.parse_args()
+
+    args = resolve_dirs(args)
+
+    ckpt_dir = Path(args.checkpoint_dir); ckpt_dir.mkdir(parents=True, exist_ok=True)
+    log_path = ckpt_dir / "train.csv"; log_header(log_path)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    id2label = {i: f"class_{i}" for i in range(args.num_classes)}
+
+    cfg = SegformerConfig.from_pretrained(
+        f"nvidia/mit_{args.model_size}",
+        num_channels=5,
+        num_labels=args.num_classes,
+        id2label=id2label,
+        label2id={v: k for k, v in id2label.items()},
+        ignore_index=255,
     )
-    return dataset
 
-train_dataset = load_dataset(os.path.join(TRAIN_DIR, "images"), os.path.join(TRAIN_DIR, "masks"))
-val_dataset = load_dataset(os.path.join(VAL_DIR, "images"), os.path.join(VAL_DIR, "masks"))
+    model = SegformerForSemanticSegmentation.from_pretrained(
+        f"nvidia/mit_{args.model_size}",
+        config=cfg,
+        ignore_mismatched_sizes=True,
+    ).to(device)
 
-train_dataset = train_dataset.batch(BATCH_SIZE).prefetch(buffer_size=tf.data.AUTOTUNE)
-val_dataset = val_dataset.batch(BATCH_SIZE).prefetch(buffer_size=tf.data.AUTOTUNE)
+    train_ds = AgriVision5ChDataset(Path(args.train_rgb), Path(args.train_nir), Path(args.train_masks), size=args.img_size, augment=True)
+    val_ds = AgriVision5ChDataset(Path(args.val_rgb), Path(args.val_nir), Path(args.val_masks), size=args.img_size, augment=False)
 
-# Обучение модели
-history = vit_segmentation_model.fit(
-    train_dataset,
-    validation_data=val_dataset,
-    epochs=50,
-    callbacks=[TrainingPlotCallback()]
-)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-# Пример использования метрик на валидационном наборе
-val_images, val_masks = next(iter(val_dataset))
-val_predictions = vit_segmentation_model.predict(val_images)
-metrics = evaluate_model(val_masks.numpy(), val_predictions, NUM_CLASSES)
-plot_metrics(metrics, ["Mean Accuracy", "IoU", "F1-Score"])
+    opt = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    sched = ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3)
 
-print("Обучение завершено. Схема модели сохранена в 'vit_model_architecture.png'")
+    best_miou = 0.0
+    for epoch in range(1, args.epochs + 1):
+        print(f"\nEpoch {epoch}/{args.epochs}")
+        tr_loss, tr_acc, tr_iou = train_epoch(model, train_loader, opt, device, args.num_classes)
+        val_loss, val_acc, val_iou = eval_epoch(model, val_loader, device, args.num_classes)
+        sched.step(val_loss)
+        log_row(log_path, [epoch, tr_loss, val_loss, val_acc, val_iou])
+        print(f"loss={tr_loss:.3f}  val_loss={val_loss:.3f}  val_acc={val_acc:.3f}  val_mIoU={val_iou:.3f}")
+        if val_iou > best_miou:
+            best_miou = val_iou
+            save_ckpt(model, ckpt_dir / "best_model.pt", epoch, val_iou)
+            print(f"✔ Saved new best mIoU {val_iou:.3f} at epoch {epoch}")
+
+    print(f"Training completed. Best mIoU = {best_miou:.3f}")
+
+
+if __name__ == "__main__":
+    main()
