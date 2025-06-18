@@ -1,8 +1,7 @@
-# from neuralfield.script import config
-# from neuralfield.network import train
+# coding=utf-8
 from flet import app
 
-from neuralfield.interface.main import main_windows
+from neuralfield.interface.main import main
 
 # 1034
 
@@ -17,4 +16,4 @@ from neuralfield.interface.main import main_windows
 #     count_aug = cnn_data['count_aug']
 # )
 if __name__ == '__main__':
-    app(target=main_windows) 
+    app(target=main) 
